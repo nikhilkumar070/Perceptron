@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -16,59 +18,186 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
+logger = logging.getLogger("preceptron")
+logging.basicConfig(level=logging.INFO)
+
+BACKEND_DIR = Path(__file__).resolve().parent
+BASE_DIR = BACKEND_DIR.parent
+DATA_DIR = BASE_DIR / "data" if (BASE_DIR / "data").parent.exists() else BACKEND_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "preceptron.db"
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
-DATA_DIR.mkdir(exist_ok=True)
-UPLOAD_DIR.mkdir(exist_ok=True)
+
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+IS_POSTGRES = bool(DATABASE_URL)
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes"}
 
 app = FastAPI(title="Preceptron API", version="2.0.0")
+
+# CORS Configuration
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip()
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+if FRONTEND_URL:
+    for origin in FRONTEND_URL.split(","):
+        cleaned = origin.strip().rstrip("/")
+        if cleaned and cleaned not in allowed_origins:
+            allowed_origins.append(cleaned)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ----------------- Database layer (SQLite / Neon PostgreSQL) -----------------
 
+class Row(dict):
+    """Universal Row object supporting column name lookup, positional index, and dict conversion."""
+    def __init__(self, keys, values):
+        super().__init__(zip(keys, values))
+        self._values = list(values)
+
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            return self._values[item]
+        return super().__getitem__(item)
+
+
+def pg_row_factory(cursor):
+    titles = [c.name for c in cursor.description]
+    def make_row(values):
+        return Row(titles, values)
+    return make_row
+
+
+_pg_pool = None
+
+def get_pg_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        import psycopg_pool
+        _pg_pool = psycopg_pool.ConnectionPool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            open=True,
+            check=psycopg_pool.ConnectionPool.check_connection,
+        )
+    return _pg_pool
+
+
+class CursorWrapper:
+    def __init__(self, is_pg: bool, raw_cursor):
+        self.is_pg = is_pg
+        self.raw_cursor = raw_cursor
+
+    def fetchone(self):
+        return self.raw_cursor.fetchone()
+
+    def fetchall(self):
+        return self.raw_cursor.fetchall()
+
+
+class DBWrapper:
+    def __init__(self, is_pg: bool, conn):
+        self.is_pg = is_pg
+        self.conn = conn
+
+    def _convert_sql(self, sql: str) -> str:
+        if self.is_pg:
+            return sql.replace("?", "%s")
+        return sql
+
+    def execute(self, sql: str, params: tuple | list = ()):
+        c_sql = self._convert_sql(sql)
+        cur = self.conn.cursor()
+        cur.execute(c_sql, params)
+        return CursorWrapper(self.is_pg, cur)
+
+    def executemany(self, sql: str, seq_of_params):
+        c_sql = self._convert_sql(sql)
+        cur = self.conn.cursor()
+        cur.executemany(c_sql, seq_of_params)
+        return CursorWrapper(self.is_pg, cur)
+
+    def executescript(self, script: str):
+        if self.is_pg:
+            cur = self.conn.cursor()
+            cur.execute(script)
+        else:
+            self.conn.executescript(script)
+
+
+@contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if IS_POSTGRES:
+        pool = get_pg_pool()
+        with pool.connection() as conn:
+            conn.row_factory = pg_row_factory
+            with conn.transaction():
+                yield DBWrapper(True, conn)
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                yield DBWrapper(False, conn)
+        finally:
+            conn.close()
+
+
+SCHEMA_STATEMENTS = [
+    """CREATE TABLE IF NOT EXISTS users(
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL, role TEXT NOT NULL, profile_complete INTEGER DEFAULT 1,
+        college TEXT DEFAULT '', branch TEXT DEFAULT 'CSE', graduation_year INTEGER DEFAULT 2027,
+        target_role TEXT DEFAULT 'Software Engineer'
+    )""",
+    """CREATE TABLE IF NOT EXISTS sessions(
+        token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS tasks(
+        id TEXT PRIMARY KEY, title TEXT, category TEXT, difficulty TEXT,
+        estimated_minutes INTEGER, status TEXT, date TEXT, details TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS resume_analyses(
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL, filename TEXT, role TEXT, score INTEGER,
+        payload TEXT NOT NULL, created_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS assessment_attempts(
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL, question_id TEXT NOT NULL, selected_index INTEGER,
+        correct INTEGER NOT NULL, category TEXT NOT NULL, topic TEXT NOT NULL, difficulty TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS practice_attempts(
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL, question_id TEXT NOT NULL, selected_index INTEGER,
+        correct INTEGER NOT NULL, category TEXT NOT NULL, topic TEXT NOT NULL, difficulty TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""",
+]
 
 
 def init_db():
+    if IS_POSTGRES:
+        safe_host = re.sub(r"://([^:]+):([^@]+)@", r"://\1:****@", DATABASE_URL).split("@")[-1]
+        logger.info("Initializing PostgreSQL schema at %s", safe_host)
+    else:
+        logger.info("Initializing SQLite database at %s", DB_PATH)
+
     with db() as c:
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users(
-                id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL, role TEXT NOT NULL, profile_complete INTEGER DEFAULT 1,
-                college TEXT DEFAULT '', branch TEXT DEFAULT 'CSE', graduation_year INTEGER DEFAULT 2027,
-                target_role TEXT DEFAULT 'Software Engineer'
-            );
-            CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, title TEXT, category TEXT, difficulty TEXT,
-                estimated_minutes INTEGER, status TEXT, date TEXT, details TEXT);
-            CREATE TABLE IF NOT EXISTS resume_analyses(
-                id TEXT PRIMARY KEY, user_id TEXT NOT NULL, filename TEXT, role TEXT, score INTEGER,
-                payload TEXT NOT NULL, created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS assessment_attempts(
-                id TEXT PRIMARY KEY, user_id TEXT NOT NULL, question_id TEXT NOT NULL, selected_index INTEGER,
-                correct INTEGER NOT NULL, category TEXT NOT NULL, topic TEXT NOT NULL, difficulty TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS practice_attempts(
-                id TEXT PRIMARY KEY, user_id TEXT NOT NULL, question_id TEXT NOT NULL, selected_index INTEGER,
-                correct INTEGER NOT NULL, category TEXT NOT NULL, topic TEXT NOT NULL, difficulty TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            """
-        )
+        for stmt in SCHEMA_STATEMENTS:
+            c.execute(stmt)
         if not c.execute("SELECT 1 FROM users WHERE email=?", ("student@demo.com",)).fetchone():
             c.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?)", (
                 "student-001", "Demo Student", "student@demo.com", "demo123", "student", 1,
@@ -79,7 +208,8 @@ def init_db():
                 "tpo-001", "Placement Officer", "tpo@demo.com", "demo123", "tpo", 1,
                 "Northstar Institute of Technology", "", 2027, "Software Engineer"
             ))
-        if c.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0:
+        task_count = c.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()
+        if (task_count["c"] if task_count else 0) == 0:
             tasks = [
                 ("r1", "Binary Search: Peak Element II", "DSA", "Medium", 35, "todo", "Today", "Solve a 2D peak-element problem and explain the O(m log n) approach."),
                 ("r2", "SQL Joins Sprint", "SQL", "Easy", 25, "todo", "Today", "Practice INNER, LEFT and self joins on placement-style datasets."),
@@ -211,7 +341,14 @@ def make_session(user_id: str, response: Response):
     expiry = datetime.now(timezone.utc) + timedelta(days=14)
     with db() as c:
         c.execute("INSERT INTO sessions VALUES (?,?,?)", (token, user_id, expiry.isoformat()))
-    response.set_cookie("session", token, httponly=True, samesite="lax", max_age=14*24*3600)
+    response.set_cookie(
+        "session",
+        token,
+        httponly=True,
+        samesite="none" if COOKIE_SECURE else "lax",
+        secure=COOKIE_SECURE,
+        max_age=14 * 24 * 3600,
+    )
 
 
 @app.get("/api/health")
@@ -249,7 +386,11 @@ def logout(response: Response, session: Optional[str] = Cookie(None)):
     if session:
         with db() as c:
             c.execute("DELETE FROM sessions WHERE token=?", (session,))
-    response.delete_cookie("session")
+    response.delete_cookie(
+        "session",
+        samesite="none" if COOKIE_SECURE else "lax",
+        secure=COOKIE_SECURE,
+    )
     return {"message": "logged out"}
 
 
@@ -335,7 +476,7 @@ def assessment_answer(body: AnswerBody, session: Optional[str] = Cookie(None)):
 def roadmap(session: Optional[str] = Cookie(None)):
     require_user(session)
     with db() as c:
-        tasks = [dict(x) for x in c.execute("SELECT * FROM tasks ORDER BY date='Today' DESC, id").fetchall()]
+        tasks = [dict(x) for x in c.execute("SELECT * FROM tasks ORDER BY (CASE WHEN date='Today' THEN 1 ELSE 0 END) DESC, id").fetchall()]
     done = sum(t["status"] == "done" for t in tasks)
     return {"tasks":tasks,"progress":round(done/len(tasks)*100),"weekly_goal":"Complete 5 focused tasks"}
 
@@ -572,7 +713,7 @@ def tpo_summary(session: Optional[str] = Cookie(None)):
     return {"total_students":482,"average_readiness":67,"average_assessment":72,"roadmap_completion":61,"top_skill_gaps":[{"category":"DSA","students":184},{"category":"SQL","students":151},{"category":"Problem Solving","students":137},{"category":"Core CS","students":96}],"students_needing_support":119,"filters":{"branches":["CSE","ECE","IT","ME"],"graduation_years":[2026,2027],"target_roles":["Software Engineer","Data Analyst","Product Engineer"]}}
 
 
-# Serve the built frontend from FastAPI in production, so one URL hosts the entire app.
+# Serve the built frontend if present (e.g. single-container mode), or return API info.
 @app.get("/{full_path:path}")
 def frontend(full_path: str):
     if full_path.startswith("api/"):
@@ -584,4 +725,6 @@ def frontend(full_path: str):
         index = FRONTEND_DIST / "index.html"
         if index.exists():
             return FileResponse(index)
-    raise HTTPException(404, "Frontend not built. Run npm run build in frontend/")
+    if full_path == "":
+        return {"status": "ok", "service": "preceptron-api", "version": "2.0.0", "docs": "/docs"}
+    raise HTTPException(404, "Not Found")

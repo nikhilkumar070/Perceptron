@@ -1,13 +1,40 @@
 services:
+  # 1. FastAPI Web Service (Backend)
   - type: web
-    name: preceptron
-    runtime: docker
+    name: preceptron-api
+    runtime: python
+    region: singapore
     plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
     envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: COOKIE_SECURE
+        value: "true"
       - key: AI_PROVIDER
         value: local
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_MODEL
         value: gpt-5.6-luna
+
+  # 2. React/Vite Static Site (Frontend)
+  - type: static
+    name: preceptron
+    region: singapore
+    plan: free
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        sync: false

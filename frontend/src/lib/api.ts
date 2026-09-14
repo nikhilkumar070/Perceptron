@@ -1,4 +1,12 @@
-const BASE = "/api";
+const BASE = (
+  import.meta.env.VITE_API_URL ||
+  (import.meta.env.DEV ? "/api" : "http://127.0.0.1:8001/api")
+).replace(/\/$/, "");
+
+function toUrl(path: string): string {
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+  return `${BASE}${cleanPath}`;
+}
 
 export class ApiError extends Error {
   status: number;
@@ -11,11 +19,16 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<T> {
+  const res = await fetch(toUrl(path), {
     method,
     credentials: "include",
-    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    headers:
+      body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) {
@@ -27,13 +40,20 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 }
 
 export const apiGet = <T>(path: string) => request<T>("GET", path);
-export const apiPost = <T>(path: string, body?: unknown) => request<T>("POST", path, body ?? null);
-export const apiPut = <T>(path: string, body?: unknown) => request<T>("PUT", path, body ?? null);
-export const apiPatch = <T>(path: string, body?: unknown) => request<T>("PATCH", path, body ?? null);
+export const apiPost = <T>(path: string, body?: unknown) =>
+  request<T>("POST", path, body ?? null);
+export const apiPut = <T>(path: string, body?: unknown) =>
+  request<T>("PUT", path, body ?? null);
+export const apiPatch = <T>(path: string, body?: unknown) =>
+  request<T>("PATCH", path, body ?? null);
 export const apiDelete = <T>(path: string) => request<T>("DELETE", path);
 
 export async function apiUpload<T>(path: string, form: FormData): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { method: "POST", credentials: "include", body: form });
+  const res = await fetch(toUrl(path), {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
     throw new ApiError(res.status, body);

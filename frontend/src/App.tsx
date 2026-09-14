@@ -1268,8 +1268,8 @@ function Tpo({
               className={idx === 0 ? "darkCard" : idx === 3 ? "warnCard" : ""}
             >
               <Icon size={20} />
-              <small>{n}</small>
-              <b className="statNumber">{v}</b>
+              <small>{n as ReactNode}</small>
+              <b className="statNumber">{v as ReactNode}</b>
             </Card>
           );
         })}
