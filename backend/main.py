@@ -37,9 +37,14 @@ try:
 except Exception:
     pass
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-IS_POSTGRES = bool(DATABASE_URL)
+# Database selection:
+# Relies directly on the local SQLite database by default (DB_PATH).
+# Neon PostgreSQL is only activated if USE_POSTGRES=true and DATABASE_URL is provided.
+USE_POSTGRES = os.getenv("USE_POSTGRES", "false").strip().lower() in {"1", "true", "yes"}
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip() if USE_POSTGRES else ""
+IS_POSTGRES = bool(USE_POSTGRES and DATABASE_URL)
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes"}
+
 
 app = FastAPI(title="Preceptron API", version="2.0.0")
 
