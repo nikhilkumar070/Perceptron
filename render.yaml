@@ -24,14 +24,21 @@ services:
         value: gpt-5.6-luna
 
   # 2. React/Vite Static Site (Frontend)
-  - type: static
+  # NOTE: Render's Blueprint spec requires type: web + runtime: static for static sites.
+  # Using type: static is a legacy alias that does NOT support the routes field reliably.
+  - type: web
     name: preceptron
+    runtime: static
     region: singapore
     plan: free
     rootDir: frontend
     buildCommand: npm ci && npm run build
-    staticPublishPath: dist
+    staticPublishPath: ./dist
     routes:
+      # SPA fallback: rewrite all paths to index.html so React Router
+      # handles routing on the client. This is a rewrite (not a redirect):
+      # the browser URL stays as-is (e.g. /pitch stays /pitch) while
+      # Render internally serves dist/index.html.
       - type: rewrite
         source: /*
         destination: /index.html
