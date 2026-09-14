@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -188,6 +190,87 @@ SCHEMA_STATEMENTS = [
 ]
 
 
+def hash_password(password: str, salt: Optional[str] = None) -> str:
+    if not salt:
+        salt = secrets.token_hex(16)
+    hashed = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        100_000,
+    ).hex()
+    return f"pbkdf2_sha256${salt}${hashed}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    if not stored_hash:
+        return False
+    if stored_hash == password:
+        return True
+    if not stored_hash.startswith("pbkdf2_sha256$"):
+        return False
+    try:
+        parts = stored_hash.split("$")
+        if len(parts) != 3:
+            return False
+        _, salt, expected_hash = parts
+        candidate_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            100_000,
+        ).hex()
+        return hmac.compare_digest(candidate_hash, expected_hash)
+    except Exception:
+        return False
+
+
+def seed_demo_users(c):
+    # 1. Demo student
+    student_email = "student@demo.com"
+    student_row = c.execute("SELECT * FROM users WHERE email=?", (student_email,)).fetchone()
+    if not student_row:
+        c.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?)", (
+            "student-001", "Demo Student", student_email, hash_password("demo123"), "student", 1,
+            "Northstar Institute of Technology", "CSE", 2027, "Software Engineer"
+        ))
+    else:
+        needs_fix = False
+        stored_pw = student_row["password"] or ""
+        if not stored_pw.startswith("pbkdf2_sha256$") or not verify_password("demo123", stored_pw):
+            needs_fix = True
+        if student_row["role"] != "student":
+            needs_fix = True
+        if needs_fix:
+            c.execute(
+                "UPDATE users SET password=?, role=?, name=? WHERE email=?",
+                (hash_password("demo123"), "student", "Demo Student", student_email)
+            )
+    logger.info("Demo student account ready")
+
+    # 2. Demo TPO
+    tpo_email = "tpo@demo.com"
+    tpo_row = c.execute("SELECT * FROM users WHERE email=?", (tpo_email,)).fetchone()
+    if not tpo_row:
+        c.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?)", (
+            "tpo-001", "Placement Officer", tpo_email, hash_password("demo123"), "tpo", 1,
+            "Northstar Institute of Technology", "", 2027, "Software Engineer"
+        ))
+    else:
+        needs_fix = False
+        stored_pw = tpo_row["password"] or ""
+        if not stored_pw.startswith("pbkdf2_sha256$") or not verify_password("demo123", stored_pw):
+            needs_fix = True
+        if tpo_row["role"] != "tpo":
+            needs_fix = True
+        if needs_fix:
+            c.execute(
+                "UPDATE users SET password=?, role=?, name=? WHERE email=?",
+                (hash_password("demo123"), "tpo", "Placement Officer", tpo_email)
+            )
+    logger.info("Demo TPO account ready")
+
+
 def init_db():
     if IS_POSTGRES:
         safe_host = re.sub(r"://([^:]+):([^@]+)@", r"://\1:****@", DATABASE_URL).split("@")[-1]
@@ -198,16 +281,7 @@ def init_db():
     with db() as c:
         for stmt in SCHEMA_STATEMENTS:
             c.execute(stmt)
-        if not c.execute("SELECT 1 FROM users WHERE email=?", ("student@demo.com",)).fetchone():
-            c.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?)", (
-                "student-001", "Demo Student", "student@demo.com", "demo123", "student", 1,
-                "Northstar Institute of Technology", "CSE", 2027, "Software Engineer"
-            ))
-        if not c.execute("SELECT 1 FROM users WHERE email=?", ("tpo@demo.com",)).fetchone():
-            c.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?)", (
-                "tpo-001", "Placement Officer", "tpo@demo.com", "demo123", "tpo", 1,
-                "Northstar Institute of Technology", "", 2027, "Software Engineer"
-            ))
+        seed_demo_users(c)
         task_count = c.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()
         if (task_count["c"] if task_count else 0) == 0:
             tasks = [
@@ -348,6 +422,7 @@ def make_session(user_id: str, response: Response):
         samesite="none" if COOKIE_SECURE else "lax",
         secure=COOKIE_SECURE,
         max_age=14 * 24 * 3600,
+        path="/",
     )
 
 
@@ -360,8 +435,12 @@ def health():
 def login(body: LoginBody, response: Response):
     with db() as c:
         u = c.execute("SELECT * FROM users WHERE email=?", (body.email.strip().lower(),)).fetchone()
-    if not u or u["password"] != body.password:
+    if not u or not verify_password(body.password, u["password"]):
         raise HTTPException(401, "Invalid email or password")
+    # Upgrade legacy plaintext password if encountered
+    if u["password"] == body.password:
+        with db() as c:
+            c.execute("UPDATE users SET password=? WHERE id=?", (hash_password(body.password), u["id"]))
     make_session(u["id"], response)
     return {"user": public_user(u)}
 
@@ -371,11 +450,12 @@ def signup(body: SignupBody, response: Response):
     if len(body.password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
     role = body.role if body.role in {"student", "tpo"} else "student"
+    hashed_password = hash_password(body.password)
     with db() as c:
         if c.execute("SELECT 1 FROM users WHERE email=?", (body.email.strip().lower(),)).fetchone():
             raise HTTPException(409, "An account with this email already exists")
         uid = str(uuid.uuid4())
-        c.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?)", (uid, body.name, body.email.strip().lower(), body.password, role, 1, "", "CSE", 2027, "Software Engineer"))
+        c.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?)", (uid, body.name, body.email.strip().lower(), hashed_password, role, 1, "", "CSE", 2027, "Software Engineer"))
         u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
     make_session(uid, response)
     return {"user": public_user(u)}
@@ -390,6 +470,7 @@ def logout(response: Response, session: Optional[str] = Cookie(None)):
         "session",
         samesite="none" if COOKIE_SECURE else "lax",
         secure=COOKIE_SECURE,
+        path="/",
     )
     return {"message": "logged out"}
 
