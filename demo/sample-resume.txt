@@ -1,0 +1,25 @@
+Aarav Sharma
+Software Engineer
+aarav@example.com | github.com/aarav | linkedin.com/in/aarav
+
+SUMMARY
+Computer Science student building web applications and developer tools.
+
+EDUCATION
+B.Tech Computer Science Engineering | 2027
+
+PROJECTS
+Preceptron — Placement Readiness Platform
+- Built a React and FastAPI platform that connects assessments, roadmaps and practice.
+- Implemented authentication and REST APIs for student and TPO workflows.
+
+CampusCart
+- Developed a TypeScript web application for campus commerce.
+- Improved page load performance by 28% through code splitting and asset optimization.
+
+SKILLS
+Python, C++, JavaScript, TypeScript, React, FastAPI, SQL, Git
+
+EXPERIENCE
+Software Engineering Intern
+- Implemented API features and fixed production issues with the engineering team.

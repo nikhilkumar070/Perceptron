@@ -1,0 +1,2 @@
+Software Engineer Intern
+We are looking for students with strong programming fundamentals and experience with Python, TypeScript, React, REST APIs, SQL, Git and problem solving. Candidates should be able to build reliable features, write maintainable code, debug issues and communicate technical decisions clearly.

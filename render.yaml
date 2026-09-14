@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: preceptron
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: AI_PROVIDER
+        value: local
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5.6-luna
