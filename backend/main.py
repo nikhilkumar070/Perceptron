@@ -45,15 +45,21 @@ app = FastAPI(title="Preceptron API", version="2.0.0")
 
 # CORS Configuration
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip()
+# Always allow the known production origin so cross-origin cookies work even
+# if the FRONTEND_URL env var is not set on Render.
+_PRODUCTION_ORIGIN = "https://perceptron-texd.onrender.com"
 allowed_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    _PRODUCTION_ORIGIN,
 ]
 if FRONTEND_URL:
     for origin in FRONTEND_URL.split(","):
         cleaned = origin.strip().rstrip("/")
         if cleaned and cleaned not in allowed_origins:
             allowed_origins.append(cleaned)
+logger.info("CORS allowed_origins: %s", allowed_origins)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -319,7 +325,30 @@ def init_db():
             c.executemany("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?)", tasks)
 
 
-init_db()
+
+_db_initialized = False
+
+try:
+    init_db()
+    _db_initialized = True
+except Exception as _init_exc:
+    logger.error("[STARTUP] init_db() failed at module load: %s", _init_exc)
+    logger.error("[STARTUP] Will retry init_db() on first request via startup event.")
+
+
+@app.on_event("startup")
+async def startup_event():
+    global _db_initialized
+    if not _db_initialized:
+        logger.info("[STARTUP] Retrying init_db() in startup event …")
+        try:
+            init_db()
+            _db_initialized = True
+            logger.info("[STARTUP] init_db() succeeded on retry.")
+        except Exception as exc:
+            logger.error("[STARTUP] init_db() retry failed: %s", exc)
+    else:
+        logger.info("[STARTUP] DB already initialized.")
 
 SKILLS = [
     {"category": "DSA", "score": 68, "label": "Developing"},
@@ -458,16 +487,34 @@ def health():
 
 @app.post("/api/auth/login")
 def login(body: LoginBody, response: Response):
-    with db() as c:
-        u = c.execute("SELECT * FROM users WHERE email=?", (body.email.strip().lower(),)).fetchone()
-    if not u or not verify_password(body.password, u["password"]):
+    email = body.email.strip().lower()
+    logger.info("[AUTH] Login attempt for: %s", email)
+    try:
+        with db() as c:
+            u = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    except Exception as exc:
+        logger.error("[AUTH] DB error fetching user for %s: %s", email, exc)
+        raise HTTPException(500, "Database error during login")
+    if not u:
+        logger.warning("[AUTH] User not found: %s", email)
+        raise HTTPException(401, "Invalid email or password")
+    stored_pw = u["password"] or ""
+    if not verify_password(body.password, stored_pw):
+        logger.warning("[AUTH] Password verification failed for: %s (hash prefix: %s)", email, stored_pw[:14] if stored_pw else "empty")
         raise HTTPException(401, "Invalid email or password")
     # Upgrade legacy plaintext password if encountered
-    if u["password"] == body.password:
+    if stored_pw == body.password:
+        logger.info("[AUTH] Upgrading plaintext password for: %s", email)
         with db() as c:
             c.execute("UPDATE users SET password=? WHERE id=?", (hash_password(body.password), u["id"]))
-    make_session(u["id"], response)
+    try:
+        make_session(u["id"], response)
+    except Exception as exc:
+        logger.error("[AUTH] Session creation failed for %s: %s", email, exc)
+        raise HTTPException(500, "Session creation failed")
+    logger.info("[AUTH] Login successful for: %s (role=%s)", email, u["role"])
     return {"user": public_user(u)}
+
 
 
 @app.post("/api/auth/signup")

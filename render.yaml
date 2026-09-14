@@ -29,8 +29,8 @@ services:
     region: singapore
     plan: free
     rootDir: frontend
-    buildCommand: npm install && npm run build
-    staticPublishPath: ./dist
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
     routes:
       - type: rewrite
         source: /*

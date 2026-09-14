@@ -1551,6 +1551,18 @@ function App() {
   );
 }
 export default function Root() {
+  // Issue 1: fire-and-forget health ping to wake the Render backend.
+  // Runs once after mount; does NOT block rendering or show a loader.
+  useEffect(() => {
+    const apiBase = (
+      import.meta.env.VITE_API_URL ||
+      (import.meta.env.DEV ? "/api" : "http://127.0.0.1:8001/api")
+    ).replace(/\/$/, "");
+    fetch(`${apiBase}/health`, { method: "GET", credentials: "include" }).catch(
+      () => {},
+    );
+  }, []);
+
   return (
     <BrowserRouter>
       <App />
