@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import hmac
 import json
@@ -77,6 +78,12 @@ class Row(dict):
 
 
 def pg_row_factory(cursor):
+    if cursor.description is None:
+        try:
+            from psycopg.rows import no_result
+            return no_result
+        except Exception:
+            return None
     titles = [c.name for c in cursor.description]
     def make_row(values):
         return Row(titles, values)
@@ -84,6 +91,20 @@ def pg_row_factory(cursor):
 
 
 _pg_pool = None
+
+
+def _cleanup_pg_pool():
+    global _pg_pool
+    if _pg_pool is not None:
+        try:
+            _pg_pool.close()
+        except Exception:
+            pass
+        _pg_pool = None
+
+
+atexit.register(_cleanup_pg_pool)
+
 
 def get_pg_pool():
     global _pg_pool
@@ -105,9 +126,13 @@ class CursorWrapper:
         self.raw_cursor = raw_cursor
 
     def fetchone(self):
+        if self.is_pg and getattr(self.raw_cursor, "description", None) is None:
+            return None
         return self.raw_cursor.fetchone()
 
     def fetchall(self):
+        if self.is_pg and getattr(self.raw_cursor, "description", None) is None:
+            return []
         return self.raw_cursor.fetchall()
 
 
