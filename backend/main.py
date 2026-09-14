@@ -84,16 +84,15 @@ class Row(dict):
 
 
 def pg_row_factory(cursor):
-    if cursor.description is None:
-        try:
-            from psycopg.rows import no_result
-            return no_result
-        except Exception:
-            return None
-    titles = [c.name for c in cursor.description]
+    desc = getattr(cursor, "description", None)
+    if not desc:
+        from psycopg.rows import no_result
+        return no_result
+    titles = [c.name for c in desc]
     def make_row(values):
         return Row(titles, values)
     return make_row
+
 
 
 _pg_pool = None
